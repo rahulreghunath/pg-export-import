@@ -1,0 +1,18 @@
+[project]
+name = "pg-export-import"
+version = "0.1.0"
+description = "Stream-export filtered PostgreSQL rows to CSV and bulk-import via COPY"
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary]>=3.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: requires a real PostgreSQL instance",
+]
