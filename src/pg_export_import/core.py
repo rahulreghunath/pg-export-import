@@ -1,6 +1,6 @@
 """
-pg_export_import.py
-===================
+pg_export_import.core
+=====================
 Production-ready PostgreSQL export/import utility.
 
 Streams filtered rows from a source table to CSV, then bulk-loads them into a
@@ -80,10 +80,6 @@ Large tables
     * Ensuring sufficient disk space: CSV is text-encoded and typically
       1.5–2× the size of the raw table data.
     * Running ``VACUUM ANALYZE`` on the target after import.
-
-Example usage
--------------
-See the ``if __name__ == "__main__"`` block at the bottom of this file.
 """
 
 from __future__ import annotations
@@ -92,6 +88,7 @@ import csv
 import dataclasses
 import json
 import logging
+import os
 import re
 import tempfile
 import time
@@ -369,21 +366,16 @@ def _export_to_csv(
     csv_path: str,
     where_params: tuple[Any, ...] | dict[str, Any] | None,
     fetch_size: int,
-    column_names: list[str],
-    col_types: list[tuple[str, str]],
-) -> int:
-    """Stream rows from *table_ref* to a CSV file using a dedicated connection.
+) -> tuple[int, list[str]]:
+    """Stream rows from *table_ref* to a CSV file.
 
-    This function issues ONLY the server-side cursor DECLARE + FETCH commands
-    on *conn*.  No other queries are run on this connection before or during
-    the fetch loop.  Callers must resolve column metadata (names, types) on a
-    separate connection and pass them in — mixing metadata queries on the same
-    connection corrupts psycopg v3's wire-protocol state and causes fetchmany()
-    to return empty prematurely, silently truncating the export.
+    Uses a server-side (named) cursor so the full result set is never held
+    in memory.  Column names and type info are resolved via a lightweight
+    ``LIMIT 0`` probe before the named cursor is declared, keeping the two
+    operations cleanly separated on the same connection.
 
     Args:
-        conn: A DEDICATED connection used exclusively for the export cursor.
-            No other queries should be executed on this connection.
+        conn: An open database connection to the source.
         table_ref: Validated source table reference.
         where_clause: SQL fragment for the WHERE clause (no ``WHERE`` keyword).
             May be an empty string to export all rows.
@@ -391,18 +383,23 @@ def _export_to_csv(
         where_params: Positional tuple or named dict of bind values for
             *where_clause*.  Pass ``None`` only when *where_clause* is empty.
         fetch_size: Number of rows to fetch per round-trip.
-        column_names: Ordered column names resolved by the caller on a separate
-            connection (used as the CSV header).
-        col_types: Per-column (typname, typcategory) pairs, parallel to
-            *column_names*, used by :func:`_serialize_cell`.
 
     Returns:
-        Number of rows written to the CSV file.
+        A ``(row_count, column_names)`` tuple where *column_names* preserves
+        the server-reported column order.
 
     Raises:
         psycopg.Error: On any database error during export.
         OSError: If the CSV file cannot be written.
     """
+    # Warn when where_clause has text but no params (likely injection risk).
+    if where_clause.strip() and where_params is None:
+        logger.warning(
+            "where_clause is non-empty but where_params is None.  "
+            "Ensure where_clause does not contain user-supplied values; "
+            "pass runtime values via where_params instead."
+        )
+
     table_sql = _build_table_sql(table_ref)
 
     if where_clause.strip():
@@ -417,25 +414,43 @@ def _export_to_csv(
 
     logger.info("Starting export: table=%s where=%r", table_ref, where_clause or "(none)")
 
-    row_count = 0
-    batch_num = 0
+    # Resolve column names and type info via a LIMIT 0 probe BEFORE declaring
+    # the named server-side cursor.
+    #
+    # Safety note — same connection, sequential cursors:
+    # Both the probe cursor and _fetch_column_type_info run on *conn* before
+    # the named cursor is declared.  psycopg v3 processes one command at a time
+    # on a connection; as long as each client-side cursor is fully closed (the
+    # `with` block exits) before the next command is issued, the wire-protocol
+    # state is clean.  The probe cursor fetches 0 rows and the type-info query
+    # calls fetchall(), so both are fully consumed before DECLARE is sent.
+    # This is safe; the concern about truncation only arises when a second
+    # cursor sends a command WHILE a named cursor's FETCH is in flight.
+    with conn.cursor() as probe_cur:
+        probe_cur.execute(
+            sql.SQL("SELECT * FROM ") + _build_table_sql(table_ref) + sql.SQL(" LIMIT 0")
+        )
+        if probe_cur.description is None:
+            raise RuntimeError("cursor.description is None after LIMIT 0 probe.")
+        column_names = [col.name for col in probe_cur.description]
+        oids = [col.type_code for col in probe_cur.description]
 
-    print(f"[DEBUG] Opening named server-side cursor 'pg_export_cursor' (dedicated connection), fetch_size={fetch_size}")
+    logger.debug("Source columns (%d): %s", len(column_names), column_names)
+    type_info = _fetch_column_type_info(conn, oids)
+    col_types = [type_info.get(oid, ("unknown", "")) for oid in oids]
+
+    row_count = 0
+
     with conn.cursor(name="pg_export_cursor") as cur:
         cur.execute(query, where_params)
-        print(f"[DEBUG] Query executed on server-side cursor — starting fetch loop")
 
         with open(csv_path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
             writer.writerow(column_names)  # header
-            print(f"[DEBUG] CSV header written to {csv_path!r}")
 
             while True:
                 rows = cur.fetchmany(fetch_size)
-                batch_num += 1
-                print(f"[DEBUG] Batch {batch_num}: fetched {len(rows)} rows (cumulative: {row_count + len(rows)})")
                 if not rows:
-                    print(f"[DEBUG] Empty batch — fetch loop complete")
                     break
                 for row in rows:
                     writer.writerow(
@@ -445,10 +460,8 @@ def _export_to_csv(
                 if row_count % 50_000 == 0:
                     logger.info("  … exported %d rows so far", row_count)
 
-    csv_size = Path(csv_path).stat().st_size
-    print(f"[DEBUG] Export done: {row_count} rows, {batch_num - 1} batches, CSV size={csv_size:,} bytes ({csv_path!r})")
     logger.info("Export complete: %d rows → %s", row_count, csv_path)
-    return row_count
+    return row_count, column_names
 
 
 def _import_from_csv(
@@ -496,12 +509,7 @@ def _import_from_csv(
         columns,
         csv_path,
     )
-    csv_size = Path(csv_path).stat().st_size
-    print(f"[DEBUG] Import starting: table={table_ref!r}, {len(columns)} columns, CSV size={csv_size:,} bytes")
-    print(f"[DEBUG] Import columns: {columns}")
 
-    blocks_written = 0
-    bytes_written = 0
     with conn.cursor() as cur:
         with cur.copy(copy_sql) as copy:
             with open(csv_path, "rb") as fh:
@@ -510,13 +518,9 @@ def _import_from_csv(
                     if not block:
                         break
                     copy.write(block)
-                    blocks_written += 1
-                    bytes_written += len(block)
-                    print(f"[DEBUG]   COPY block {blocks_written}: {len(block):,} bytes sent (total: {bytes_written:,})")
 
         imported = cur.rowcount
 
-    print(f"[DEBUG] Import done: {imported} rows imported via {blocks_written} COPY blocks")
     logger.info("Import complete: %d rows ← %s", imported, csv_path)
     return imported
 
@@ -601,7 +605,6 @@ def export_and_import(
     # --- Resolve csv_path ---
     if csv_path is None:
         fd, csv_path = tempfile.mkstemp(suffix=".csv", prefix="pg_export_")
-        import os
         os.close(fd)
         logger.debug("Using temp CSV file: %s", csv_path)
     csv_path = str(Path(csv_path).resolve())
@@ -610,99 +613,22 @@ def export_and_import(
     exported_count = 0
     imported_count = 0
 
-    print(f"[DEBUG] export_and_import start")
-    print(f"[DEBUG]   source: {source_config.host}:{source_config.port}/{source_config.dbname} user={source_config.user}")
-    print(f"[DEBUG]   target: {target_config.host}:{target_config.port}/{target_config.dbname} user={target_config.user}")
-    print(f"[DEBUG]   source_table={source_table!r}  target_table={target_table!r}")
-    print(f"[DEBUG]   where_clause={where_clause!r}  where_params={where_params!r}")
-    print(f"[DEBUG]   fetch_size={fetch_size}  csv_path={csv_path!r}")
-
     # ------------------------------------------------------------------ #
-    # Phase 1a — Metadata (separate connection, closed before export)     #
+    # Phase 1 — Export                                                     #
     # ------------------------------------------------------------------ #
-    # IMPORTANT: All schema queries (COUNT, column names, type OIDs) run on
-    # a dedicated metadata connection that is fully closed before the export
-    # connection is opened.  Running any query on the same connection that
-    # will later hold the named server-side cursor corrupts psycopg v3's
-    # wire-protocol state and causes fetchmany() to return empty prematurely,
-    # silently truncating the export.
     column_names: list[str] = []
-    col_types: list[tuple[str, str]] = []
-    expected_count: int = 0
-    print(f"\n[DEBUG] === Phase 1a: Metadata (separate connection) ===")
-    try:
-        with _connect(source_config) as meta_conn:
-            table_sql_meta = _build_table_sql(source_table)
-
-            # COUNT(*) with the same WHERE so we know the expected total.
-            if where_clause.strip():
-                count_query = (
-                    sql.SQL("SELECT COUNT(*) FROM ")
-                    + table_sql_meta
-                    + sql.SQL(" WHERE ")
-                    + sql.SQL(where_clause)
-                )
-            else:
-                count_query = sql.SQL("SELECT COUNT(*) FROM ") + table_sql_meta
-
-            with meta_conn.cursor() as mcur:
-                mcur.execute(count_query, where_params)
-                row = mcur.fetchone()
-                expected_count = row[0] if row else 0
-            print(f"[DEBUG] COUNT(*) on source: expected_count={expected_count}")
-            logger.info("Source row count: %d", expected_count)
-
-            # Schema probe — LIMIT 0 to get column names and OIDs.
-            with meta_conn.cursor() as mcur:
-                mcur.execute(
-                    sql.SQL("SELECT * FROM ") + table_sql_meta + sql.SQL(" LIMIT 0")
-                )
-                if mcur.description is None:
-                    raise RuntimeError("cursor.description is None after LIMIT 0 probe.")
-                column_names = [col.name for col in mcur.description]
-                oids = [col.type_code for col in mcur.description]
-            print(f"[DEBUG] Schema probe: {len(column_names)} columns: {column_names}")
-            print(f"[DEBUG] Column OIDs: {oids}")
-
-            # Type info lookup.
-            type_info = _fetch_column_type_info(meta_conn, oids)
-            col_types = [type_info.get(oid, ("unknown", "")) for oid in oids]
-            print(f"[DEBUG] Resolved column types: { {col: ct for col, ct in zip(column_names, col_types)} }")
-        # meta_conn is now fully closed — the export connection is clean.
-        print(f"[DEBUG] Metadata connection closed")
-    except Exception as exc:
-        logger.error("Metadata fetch failed: %s", exc, exc_info=True)
-        print(f"[DEBUG] Metadata fetch FAILED: {exc}")
-        return ExportImportResult(
-            exported_count=0,
-            imported_count=0,
-            csv_path=csv_path,
-            source_table=source_table,
-            target_table=target_table,
-            status="export_failed",
-            error=f"Metadata fetch failed: {exc}",
-            duration_seconds=time.monotonic() - start,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Phase 1b — Export (dedicated connection, no other queries)          #
-    # ------------------------------------------------------------------ #
-    print(f"\n[DEBUG] === Phase 1b: Export (dedicated connection) ===")
     try:
         with _connect(source_config) as src_conn:
-            exported_count = _export_to_csv(
+            exported_count, column_names = _export_to_csv(
                 conn=src_conn,
                 table_ref=source_table,
                 where_clause=where_clause,
                 csv_path=csv_path,
                 where_params=where_params,
                 fetch_size=fetch_size,
-                column_names=column_names,
-                col_types=col_types,
             )
     except Exception as exc:
         logger.error("Export failed: %s", exc, exc_info=True)
-        print(f"[DEBUG] Export FAILED after {time.monotonic() - start:.2f}s: {exc}")
         return ExportImportResult(
             exported_count=0,
             imported_count=0,
@@ -714,21 +640,9 @@ def export_and_import(
             duration_seconds=time.monotonic() - start,
         )
 
-    export_elapsed = time.monotonic() - start
-    print(f"[DEBUG] Phase 1 complete: exported_count={exported_count}  expected={expected_count}  elapsed={export_elapsed:.2f}s")
-    if exported_count != expected_count:
-        msg = (
-            f"Row count mismatch: exported {exported_count} rows but "
-            f"COUNT(*) returned {expected_count} before export started. "
-            f"The export is incomplete."
-        )
-        logger.warning(msg)
-        print(f"[DEBUG] WARNING: {msg}")
-
     # Zero-row export is valid — skip import to avoid an empty COPY.
     if exported_count == 0:
         logger.info("Zero rows exported; skipping import.")
-        print(f"[DEBUG] Zero rows exported — skipping import phase")
         return ExportImportResult(
             exported_count=0,
             imported_count=0,
@@ -742,7 +656,6 @@ def export_and_import(
     # ------------------------------------------------------------------ #
     # Phase 2 — Import                                                     #
     # ------------------------------------------------------------------ #
-    print(f"\n[DEBUG] === Phase 2: Import ===")
     try:
         with _connect(target_config) as tgt_conn:
             try:
@@ -758,7 +671,6 @@ def export_and_import(
                 raise
     except Exception as exc:
         logger.error("Import failed: %s", exc, exc_info=True)
-        print(f"[DEBUG] Import FAILED after {time.monotonic() - start:.2f}s total: {exc}")
         return ExportImportResult(
             exported_count=exported_count,
             imported_count=0,
@@ -770,10 +682,6 @@ def export_and_import(
             duration_seconds=time.monotonic() - start,
         )
 
-    total_elapsed = time.monotonic() - start
-    print(f"[DEBUG] Phase 2 complete: imported_count={imported_count}  elapsed={total_elapsed:.2f}s total")
-    print(f"[DEBUG] Final result: status=success  exported={exported_count}  imported={imported_count}  duration={total_elapsed:.2f}s")
-
     return ExportImportResult(
         exported_count=exported_count,
         imported_count=imported_count,
@@ -781,72 +689,5 @@ def export_and_import(
         source_table=source_table,
         target_table=target_table,
         status="success",
-        duration_seconds=total_elapsed,
+        duration_seconds=time.monotonic() - start,
     )
-
-
-# ---------------------------------------------------------------------------
-# Example usage
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import os
-
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    )
-
-    # ------------------------------------------------------------------
-    # Example 1: Export active users from production → staging
-    # ------------------------------------------------------------------
-    # Production and staging share the same schema; only active users are
-    # migrated.  Passwords come from environment variables — never hard-code.
-
-    prod_cfg = ConnectionConfig(
-        host=os.environ.get("PROD_PG_HOST", "prod-db.example.com"),
-        dbname=os.environ.get("PROD_PG_DB", "app_production"),
-        user=os.environ.get("PROD_PG_USER", "readonly_user"),
-        password=os.environ.get("PROD_PG_PASSWORD", ""),
-    )
-    staging_cfg = ConnectionConfig(
-        host=os.environ.get("STAGING_PG_HOST", "staging-db.example.com"),
-        dbname=os.environ.get("STAGING_PG_DB", "app_staging"),
-        user=os.environ.get("STAGING_PG_USER", "rw_user"),
-        password=os.environ.get("STAGING_PG_PASSWORD", ""),
-    )
-
-    print("\n--- Example 1: active users ---")
-    result1 = export_and_import(
-        source_config=prod_cfg,
-        target_config=staging_cfg,
-        source_table="public.users",
-        target_table="public.users",
-        where_clause="status = %s",
-        where_params=("active",),
-        csv_path="/tmp/active_users.csv",
-    )
-    print(result1)
-    if result1.status == "success":
-        os.remove(result1.csv_path)  # caller cleans up after success
-
-    # ------------------------------------------------------------------
-    # Example 2: Export recent orders with a date range filter
-    # ------------------------------------------------------------------
-    # Note: orders references customers — import customers first if the
-    # target table has a foreign key constraint on customer_id.
-    from datetime import datetime
-
-    print("\n--- Example 2: recent orders ---")
-    result2 = export_and_import(
-        source_config=prod_cfg,
-        target_config=staging_cfg,
-        source_table="sales.orders",
-        target_table="sales.orders",
-        where_clause="created_at >= %s AND created_at < %s AND status != %s",
-        where_params=(datetime(2024, 1, 1), datetime(2024, 4, 1), "cancelled"),
-        # csv_path omitted → auto-generated temp file
-    )
-    print(result2)
-    if result2.status == "success":
-        os.remove(result2.csv_path)

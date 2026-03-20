@@ -1,0 +1,312 @@
+"""
+pg_export_import.pipeline
+=========================
+Orchestrates a sequential, FK-aware export/import pipeline across multiple
+PostgreSQL tables using :func:`pg_export_import.core.export_and_import`.
+
+Pipeline flow per table
+-----------------------
+1. DELETE matching rows from the target table (idempotent re-runs)
+2. Call export_and_import  (export source → CSV → import target)
+3. Delete the CSV file on success
+
+FK ordering
+-----------
+The ``tables`` list is processed top-to-bottom.  Put parent tables first so
+that:
+  - DELETE on the target does not violate FK constraints from child rows
+    (delete children before parents if the target already has child rows)
+  - IMPORT respects FK constraints (parents exist before children are inserted)
+
+CSV file naming
+---------------
+Each pipeline run captures a single timestamp at start.  All CSV files for
+that run share the same timestamp in their names::
+
+    {csv_dir}/{source_table}_{YYYYMMDD_HHMMSS}.csv
+
+Dots in schema-qualified names are replaced with underscores, e.g.
+``public.orders`` → ``public_orders_20250320_143022.csv``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import tempfile
+from datetime import datetime
+from typing import Any
+
+import psycopg
+from psycopg import sql
+
+from pg_export_import.core import (
+    ConnectionConfig,
+    ExportImportResult,
+    _build_table_sql,
+    export_and_import,
+)
+
+__all__ = ["run_pipeline", "delete_target_rows"]
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helper: delete matching rows from target
+# ---------------------------------------------------------------------------
+
+
+def delete_target_rows(
+    target_config: ConnectionConfig,
+    table_ref: str,
+    where_clause: str,
+    where_params: tuple[Any, ...] | dict[str, Any] | None,
+) -> int:
+    """Delete rows from *table_ref* on the target DB matching *where_clause*.
+
+    Opens its own connection, executes the DELETE, commits, and returns the
+    number of rows deleted.  If *where_clause* is empty, ALL rows in the table
+    are deleted (a warning is logged).
+
+    Args:
+        target_config: Target database connection parameters.
+        table_ref: Table reference, e.g. ``"public.orders"`` or ``"orders"``.
+        where_clause: SQL WHERE fragment (no ``WHERE`` keyword).  Empty string
+            deletes all rows.
+        where_params: Bind values for placeholders in *where_clause*.
+
+    Returns:
+        Number of rows deleted.
+
+    Raises:
+        psycopg.Error: On any database error.
+        ValueError: If *table_ref* contains invalid identifiers.
+    """
+    table_sql = _build_table_sql(table_ref)  # validates identifiers
+
+    if where_clause.strip():
+        delete_query = (
+            sql.SQL("DELETE FROM ")
+            + table_sql
+            + sql.SQL(" WHERE ")
+            + sql.SQL(where_clause)
+        )
+    else:
+        logger.warning(
+            "DELETE on %s has no WHERE clause — ALL rows will be deleted.", table_ref
+        )
+        delete_query = sql.SQL("DELETE FROM ") + table_sql
+
+    conninfo = (
+        f"host={target_config.host} "
+        f"port={target_config.port} "
+        f"dbname={target_config.dbname} "
+        f"user={target_config.user} "
+        f"password={target_config.password} "
+        f"sslmode={target_config.sslmode} "
+        f"connect_timeout={target_config.connect_timeout}"
+    )
+
+    with psycopg.connect(conninfo) as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(delete_query, where_params)
+                deleted = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    logger.info("Deleted %d rows from %s", deleted, table_ref)
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# Internal: single-table processor
+# ---------------------------------------------------------------------------
+
+
+def _process_table(
+    source_config: ConnectionConfig,
+    target_config: ConnectionConfig,
+    entry: dict,
+    idx: int,
+    total: int,
+    csv_dir: str,
+    run_ts: str,
+) -> tuple[dict, bool]:
+    """Process a single table entry: delete target rows, export/import, clean CSV.
+
+    Args:
+        source_config: Source database connection parameters.
+        target_config: Target database connection parameters.
+        entry: Table config dict (see :func:`run_pipeline` for the schema).
+        idx: 1-based position in the pipeline (for logging).
+        total: Total number of tables in the pipeline (for logging).
+        csv_dir: Directory where CSV files are written.
+        run_ts: Timestamp string shared by all tables in this pipeline run
+            (``YYYYMMDD_HHMMSS`` format).
+
+    Returns:
+        ``(row, failed)`` where *row* is the result dict and *failed* is
+        ``True`` when the step errored and the caller should halt the pipeline.
+    """
+    source_table = entry["source_table"]
+    target_table = entry["target_table"]
+    where_clause = entry.get("where_clause", "")
+    where_params = entry.get("where_params", None)
+    delete_where_clause = entry.get("delete_where_clause", where_clause)
+    delete_where_params = entry.get("delete_where_params", where_params)
+
+    logger.info(
+        "--- Table %d/%d: %s → %s  where=%r",
+        idx, total, source_table, target_table, where_clause or "(all rows)",
+    )
+
+    # Build deterministic CSV path: dots in table name replaced with underscores.
+    csv_filename = f"{source_table.replace('.', '_')}_{run_ts}.csv"
+    csv_path = os.path.join(csv_dir, csv_filename)
+
+    row: dict = {
+        "table": f"{source_table} → {target_table}",
+        "status": "pending",
+        "exported": 0,
+        "imported": 0,
+        "deleted": 0,
+        "duration": 0.0,
+        "csv_path": csv_path,
+        "error": None,
+    }
+
+    # Step 1 — DELETE matching rows from target
+    try:
+        row["deleted"] = delete_target_rows(
+            target_config, target_table, delete_where_clause, delete_where_params
+        )
+    except Exception as exc:
+        row["status"] = "delete_failed"
+        row["error"] = str(exc)
+        logger.error("DELETE failed for %s: %s", target_table, exc, exc_info=True)
+        return row, True
+
+    # Step 2 — export_and_import
+    try:
+        result: ExportImportResult = export_and_import(
+            source_config=source_config,
+            target_config=target_config,
+            source_table=source_table,
+            target_table=target_table,
+            where_clause=where_clause,
+            where_params=where_params,
+            csv_path=csv_path,
+        )
+    except Exception as exc:
+        row["status"] = "error"
+        row["error"] = str(exc)
+        logger.error("export_and_import raised for %s: %s", source_table, exc, exc_info=True)
+        return row, True
+
+    row["exported"] = result.exported_count
+    row["imported"] = result.imported_count
+    row["duration"] = result.duration_seconds
+    row["csv_path"] = result.csv_path
+    row["status"] = result.status
+    row["error"] = result.error
+
+    if result.status != "success":
+        logger.error(
+            "Table %s failed (status=%s): %s  CSV preserved at %s",
+            source_table, result.status, result.error, result.csv_path,
+        )
+        return row, True
+
+    # Step 3 — clean up CSV on success
+    try:
+        if result.csv_path and os.path.exists(result.csv_path):
+            os.remove(result.csv_path)
+            logger.debug("Removed CSV: %s", result.csv_path)
+    except OSError as exc:
+        logger.warning("Could not remove CSV %s: %s", result.csv_path, exc)
+
+    return row, False
+
+
+# ---------------------------------------------------------------------------
+# Public: pipeline orchestrator
+# ---------------------------------------------------------------------------
+
+
+def run_pipeline(
+    source_config: ConnectionConfig,
+    target_config: ConnectionConfig,
+    tables: list[dict],
+    stop_on_failure: bool = True,
+    csv_dir: str | None = None,
+) -> list[dict]:
+    """Run the export/import pipeline sequentially for each table in *tables*.
+
+    For each entry the pipeline:
+
+    1. DELETEs matching rows from the target table.
+    2. Calls :func:`~pg_export_import.core.export_and_import`
+       (export → CSV → import).
+    3. Removes the CSV file on success (preserved on failure for re-import).
+
+    CSV files are named ``{source_table}_{YYYYMMDD_HHMMSS}.csv`` where dots
+    in schema-qualified table names are replaced with underscores.  All tables
+    in a single run share the same timestamp.
+
+    Tables are processed in list order; put FK parents before children.
+
+    Args:
+        source_config: Source database connection parameters.
+        target_config: Target database connection parameters.
+        tables: Ordered list of table config dicts.  Each dict must have:
+
+            * ``source_table`` (str) — source table reference
+            * ``target_table`` (str) — target table reference
+            * ``where_clause`` (str, optional) — SQL WHERE fragment;
+              defaults to ``""`` (all rows)
+            * ``where_params`` (tuple | dict | None, optional) — bind values
+            * ``delete_where_clause`` (str, optional) — override WHERE for the
+              DELETE step; falls back to *where_clause*
+            * ``delete_where_params`` (tuple | dict | None, optional) — bind
+              values for *delete_where_clause*
+
+        stop_on_failure: If ``True`` (default), halt on the first error.
+            If ``False``, continue with remaining tables.
+        csv_dir: Directory where intermediate CSV files are written.  Created
+            automatically if it does not exist.  Defaults to the system temp
+            directory when ``None``.
+
+    Returns:
+        List of result dicts, one per table attempted:
+        ``{table, status, exported, imported, deleted, duration, csv_path, error}``
+    """
+    if not tables:
+        logger.info("Pipeline is empty — nothing to do.")
+        return []
+
+    resolved_csv_dir = csv_dir if csv_dir is not None else tempfile.gettempdir()
+    os.makedirs(resolved_csv_dir, exist_ok=True)
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    logger.info(
+        "Pipeline start: %d table(s), csv_dir=%s, run_ts=%s",
+        len(tables), resolved_csv_dir, run_ts,
+    )
+
+    total = len(tables)
+    summary: list[dict] = []
+
+    for idx, entry in enumerate(tables, start=1):
+        row, failed = _process_table(
+            source_config, target_config, entry, idx, total, resolved_csv_dir, run_ts
+        )
+        summary.append(row)
+        if failed and stop_on_failure:
+            logger.error("Stopping pipeline after failure on table %d/%d.", idx, total)
+            break
+
+    return summary

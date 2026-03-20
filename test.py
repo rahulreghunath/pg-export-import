@@ -14,5 +14,4 @@ export_and_import(source_config=ConnectionConfig(
     password='password123',
     port=5439
 ),source_table="drug_master",target_table="drug_master1",
-where_clause="created_at < %s",
-            where_params=("now()",),)
+where_clause="")
