@@ -37,89 +37,16 @@ import tempfile
 from datetime import datetime
 from typing import Any
 
-import psycopg
-from psycopg import sql
-
 from pg_export_import.core import (
     ConnectionConfig,
     ExportImportResult,
-    _build_table_sql,
+    delete_target_rows,
     export_and_import,
 )
 
 __all__ = ["run_pipeline", "delete_target_rows"]
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Helper: delete matching rows from target
-# ---------------------------------------------------------------------------
-
-
-def delete_target_rows(
-    target_config: ConnectionConfig,
-    table_ref: str,
-    where_clause: str,
-    where_params: tuple[Any, ...] | dict[str, Any] | None,
-) -> int:
-    """Delete rows from *table_ref* on the target DB matching *where_clause*.
-
-    Opens its own connection, executes the DELETE, commits, and returns the
-    number of rows deleted.  If *where_clause* is empty, ALL rows in the table
-    are deleted (a warning is logged).
-
-    Args:
-        target_config: Target database connection parameters.
-        table_ref: Table reference, e.g. ``"public.orders"`` or ``"orders"``.
-        where_clause: SQL WHERE fragment (no ``WHERE`` keyword).  Empty string
-            deletes all rows.
-        where_params: Bind values for placeholders in *where_clause*.
-
-    Returns:
-        Number of rows deleted.
-
-    Raises:
-        psycopg.Error: On any database error.
-        ValueError: If *table_ref* contains invalid identifiers.
-    """
-    table_sql = _build_table_sql(table_ref)  # validates identifiers
-
-    if where_clause.strip():
-        delete_query = (
-            sql.SQL("DELETE FROM ")
-            + table_sql
-            + sql.SQL(" WHERE ")
-            + sql.SQL(where_clause)
-        )
-    else:
-        logger.warning(
-            "DELETE on %s has no WHERE clause — ALL rows will be deleted.", table_ref
-        )
-        delete_query = sql.SQL("DELETE FROM ") + table_sql
-
-    conninfo = (
-        f"host={target_config.host} "
-        f"port={target_config.port} "
-        f"dbname={target_config.dbname} "
-        f"user={target_config.user} "
-        f"password={target_config.password} "
-        f"sslmode={target_config.sslmode} "
-        f"connect_timeout={target_config.connect_timeout}"
-    )
-
-    with psycopg.connect(conninfo) as conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(delete_query, where_params)
-                deleted = cur.rowcount
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-
-    logger.info("Deleted %d rows from %s", deleted, table_ref)
-    return deleted
 
 
 # ---------------------------------------------------------------------------

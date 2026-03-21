@@ -101,6 +101,7 @@ from psycopg import sql
 __all__ = [
     "ConnectionConfig",
     "ExportImportResult",
+    "delete_target_rows",
     "export_and_import",
 ]
 
@@ -302,10 +303,13 @@ class ExportImportResult:
     Attributes:
         exported_count: Number of rows written to the CSV file.
         imported_count: Number of rows loaded into the target table.
+        deleted_count: Number of rows deleted from the target table before
+            import.  ``0`` when ``delete_before_import=False`` (the default).
         csv_path: Absolute path to the CSV file on disk.
         source_table: Table reference used as the export source.
         target_table: Table reference used as the import target.
-        status: ``"success"``, ``"export_failed"``, or ``"import_failed"``.
+        status: ``"success"``, ``"export_failed"``, ``"import_failed"``, or
+            ``"delete_failed"``.
         error: Human-readable error message when *status* is not ``"success"``.
         duration_seconds: Wall-clock time of the entire operation.
     """
@@ -316,6 +320,7 @@ class ExportImportResult:
     source_table: str
     target_table: str
     status: str
+    deleted_count: int = 0
     error: str | None = None
     duration_seconds: float = 0.0
 
@@ -530,6 +535,61 @@ def _import_from_csv(
 # ---------------------------------------------------------------------------
 
 
+def delete_target_rows(
+    target_config: ConnectionConfig,
+    table_ref: str,
+    where_clause: str,
+    where_params: tuple[Any, ...] | dict[str, Any] | None,
+) -> int:
+    """Delete rows from *table_ref* on the target DB matching *where_clause*.
+
+    Opens its own connection, executes the DELETE, commits, and returns the
+    number of rows deleted.  If *where_clause* is empty, ALL rows in the table
+    are deleted (a warning is logged).
+
+    Args:
+        target_config: Target database connection parameters.
+        table_ref: Table reference, e.g. ``"public.orders"`` or ``"orders"``.
+        where_clause: SQL WHERE fragment (no ``WHERE`` keyword).  Empty string
+            deletes all rows.
+        where_params: Bind values for placeholders in *where_clause*.
+
+    Returns:
+        Number of rows deleted.
+
+    Raises:
+        psycopg.Error: On any database error.
+        ValueError: If *table_ref* contains invalid identifiers.
+    """
+    table_sql = _build_table_sql(table_ref)  # validates identifiers
+
+    if where_clause.strip():
+        delete_query = (
+            sql.SQL("DELETE FROM ")
+            + table_sql
+            + sql.SQL(" WHERE ")
+            + sql.SQL(where_clause)
+        )
+    else:
+        logger.warning(
+            "DELETE on %s has no WHERE clause — ALL rows will be deleted.", table_ref
+        )
+        delete_query = sql.SQL("DELETE FROM ") + table_sql
+
+    with _connect(target_config) as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(delete_query, where_params)
+                deleted = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    logger.info("Deleted %d rows from %s", deleted, table_ref)
+    return deleted
+
+
 def export_and_import(
     source_config: ConnectionConfig,
     target_config: ConnectionConfig,
@@ -539,37 +599,48 @@ def export_and_import(
     csv_path: str | None = None,
     where_params: tuple[Any, ...] | dict[str, Any] | None = None,
     fetch_size: int = 5000,
+    delete_before_import: bool = False,
+    delete_where_clause: str | None = None,
+    delete_where_params: tuple[Any, ...] | dict[str, Any] | None = None,
 ) -> ExportImportResult:
     """Export filtered rows from a source table and import them into a target table.
 
-    **Two-phase process**:
+    **Three-phase process** (when ``delete_before_import=True``):
 
     1. *Export* – Connects to *source_config*, opens a server-side cursor,
        streams rows matching *where_clause* to a CSV file on local disk.
-    2. *Import* – Connects to *target_config*, issues
+    2. *Delete* – Connects to *target_config* and deletes matching rows from
+       the target table.  Skipped when ``delete_before_import=False``
+       (the default).  The delete runs **after** export so the CSV is a
+       durable checkpoint — if delete fails, no source data is lost.
+       If zero rows were exported, the delete step is also skipped.
+    3. *Import* – Connects to *target_config*, issues
        ``COPY target_table (...) FROM STDIN WITH CSV HEADER``, loading the CSV
        file written in phase 1.  The import is atomic: any failure triggers a
        full rollback.
 
-    The CSV file acts as a durable checkpoint.  If the import fails, the
-    exported data remains on disk and can be re-imported after fixing the
-    issue.  **The caller is responsible for deleting the file after a
-    successful import.**
+    The CSV file acts as a durable checkpoint.  If the import fails after a
+    successful delete, the target table will have fewer rows; the CSV file is
+    preserved for manual re-import.  **The caller is responsible for deleting
+    the file after a successful import.**
 
-    Security warning — ``where_clause``
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    ``where_clause`` is embedded into the SELECT statement as a raw SQL
-    fragment.  The text itself is **not** parameterised.  Rules:
+    Security warning — ``where_clause`` / ``delete_where_clause``
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    Both clauses are embedded as raw SQL fragments.  The text itself is
+    **not** parameterised.  Rules:
 
-    * The clause text MUST originate from trusted application code.
-    * Runtime values MUST be passed via ``where_params``, never interpolated
-      into the clause string itself.
+    * Clause text MUST originate from trusted application code.
+    * Runtime values MUST be passed via the corresponding ``*_params``
+      argument, never interpolated into the clause string itself.
     * Example safe usage::
 
           export_and_import(
               ...,
               where_clause="status = %s AND created_at > %s",
               where_params=("active", datetime(2024, 1, 1)),
+              delete_before_import=True,
+              delete_where_clause="status = %s",
+              delete_where_params=("active",),
           )
 
     * Unsafe usage (do not do this)::
@@ -590,9 +661,19 @@ def export_and_import(
             temporary file is created in the system temp directory.
         where_params: Bind values for ``where_clause`` placeholders.
         fetch_size: Rows fetched per round-trip from the source cursor.
+        delete_before_import: When ``True``, delete matching rows from the
+            target table after a successful export but before the import.
+            Defaults to ``False`` (append-only / no deletion).
+        delete_where_clause: SQL WHERE fragment used for the DELETE.  When
+            ``None`` (the default), falls back to *where_clause* so the same
+            filter governs both the export and the delete.
+        delete_where_params: Bind values for *delete_where_clause*.  When
+            ``None`` and *delete_where_clause* is also ``None``, falls back to
+            *where_params*.
 
     Returns:
         An :class:`ExportImportResult` with counts, paths, and status.
+        ``result.deleted_count`` reports how many rows were deleted.
 
     Raises:
         ValueError: If any table identifier is invalid (fast-fail, before any
@@ -612,6 +693,7 @@ def export_and_import(
     start = time.monotonic()
     exported_count = 0
     imported_count = 0
+    deleted_count = 0
 
     # ------------------------------------------------------------------ #
     # Phase 1 — Export                                                     #
@@ -640,9 +722,9 @@ def export_and_import(
             duration_seconds=time.monotonic() - start,
         )
 
-    # Zero-row export is valid — skip import to avoid an empty COPY.
+    # Zero-row export is valid — skip delete and import to avoid an empty COPY.
     if exported_count == 0:
-        logger.info("Zero rows exported; skipping import.")
+        logger.info("Zero rows exported; skipping delete and import.")
         return ExportImportResult(
             exported_count=0,
             imported_count=0,
@@ -652,6 +734,36 @@ def export_and_import(
             status="success",
             duration_seconds=time.monotonic() - start,
         )
+
+    # ------------------------------------------------------------------ #
+    # Phase 1.5 — Delete (optional)                                        #
+    # ------------------------------------------------------------------ #
+    if delete_before_import:
+        # Resolve effective delete clause/params, falling back to the export
+        # filter when no explicit delete filter was provided.
+        effective_delete_clause = (
+            delete_where_clause if delete_where_clause is not None else where_clause
+        )
+        effective_delete_params = (
+            delete_where_params if delete_where_clause is not None else where_params
+        )
+        try:
+            deleted_count = delete_target_rows(
+                target_config, target_table, effective_delete_clause, effective_delete_params
+            )
+        except Exception as exc:
+            logger.error("Delete failed: %s", exc, exc_info=True)
+            return ExportImportResult(
+                exported_count=exported_count,
+                imported_count=0,
+                deleted_count=0,
+                csv_path=csv_path,
+                source_table=source_table,
+                target_table=target_table,
+                status="delete_failed",
+                error=str(exc),
+                duration_seconds=time.monotonic() - start,
+            )
 
     # ------------------------------------------------------------------ #
     # Phase 2 — Import                                                     #
@@ -674,6 +786,7 @@ def export_and_import(
         return ExportImportResult(
             exported_count=exported_count,
             imported_count=0,
+            deleted_count=deleted_count,
             csv_path=csv_path,
             source_table=source_table,
             target_table=target_table,
@@ -685,6 +798,7 @@ def export_and_import(
     return ExportImportResult(
         exported_count=exported_count,
         imported_count=imported_count,
+        deleted_count=deleted_count,
         csv_path=csv_path,
         source_table=source_table,
         target_table=target_table,

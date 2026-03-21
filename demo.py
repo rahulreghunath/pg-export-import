@@ -95,35 +95,26 @@ def demo_single_table(src: ConnectionConfig, tgt: ConnectionConfig, csv_dir: str
 # ---------------------------------------------------------------------------
 
 def demo_delete_then_export(src: ConnectionConfig, tgt: ConnectionConfig, csv_dir: str) -> None:
-    """Manually delete matching rows from target, then export/import a filtered subset."""
+    """Delete matching rows from target then export/import using the built-in delete_before_import param."""
     print("\n" + "=" * 60)
-    print("DEMO 2: delete_target_rows + filtered export_and_import")
+    print("DEMO 2: export_and_import with delete_before_import=True")
     print("=" * 60)
 
-    where_clause = ""
-    where_params = None
-
-    # Step 1 — delete rows that will be re-imported
-    deleted = delete_target_rows(
-        target_config=tgt,
-        table_ref="drug_master1",
-        where_clause=where_clause,
-        where_params=where_params,
-    )
-    print(f"  Deleted  : {deleted:,} rows from target")
-
-    # Step 2 — export filtered rows and import
     result = export_and_import(
         source_config=src,
         target_config=tgt,
         source_table="drug_master",
         target_table="drug_master1",
-        where_clause=where_clause,
-        where_params=where_params,
+        where_clause="",
+        where_params=None,
         csv_path=os.path.join(csv_dir, "drug_master_filtered.csv"),
+        delete_before_import=True,       # delete target rows before importing
+        # delete_where_clause="...",     # optional: different WHERE for DELETE vs SELECT
+        # delete_where_params=(...),     # optional: bind values for delete_where_clause
     )
 
     print(f"  Status   : {result.status}")
+    print(f"  Deleted  : {result.deleted_count:,} rows from target")
     print(f"  Exported : {result.exported_count:,} rows")
     print(f"  Imported : {result.imported_count:,} rows")
     print(f"  Duration : {result.duration_seconds:.2f}s")

@@ -24,3 +24,11 @@ where = ["src"]
 markers = [
     "integration: requires a real PostgreSQL instance",
 ]
+
+[tool.uv.sources]
+pg-export-import = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pg-export-import",
+]

@@ -34,9 +34,14 @@ result = export_and_import(
     where_clause="created_at >= %s",
     where_params=("2024-01-01",),
     csv_path="/data/exports/orders.csv",   # optional; auto-generated if omitted
+    delete_before_import=True,             # optional; delete target rows before importing (default False)
+    # delete_where_clause="created_at >= %s",  # optional; defaults to where_clause
+    # delete_where_params=("2024-01-01",),     # optional; defaults to where_params
 )
-print(result.status, result.exported_count, result.imported_count)
+print(result.status, result.exported_count, result.imported_count, result.deleted_count)
 ```
+
+`result.status` is one of `"success"`, `"export_failed"`, `"delete_failed"`, or `"import_failed"`.
 
 ### Multi-table pipeline
 

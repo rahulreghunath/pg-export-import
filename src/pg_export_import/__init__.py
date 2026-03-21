@@ -18,9 +18,10 @@ Pipeline orchestrator:
 from pg_export_import.core import (
     ConnectionConfig,
     ExportImportResult,
+    delete_target_rows,
     export_and_import,
 )
-from pg_export_import.pipeline import delete_target_rows, run_pipeline
+from pg_export_import.pipeline import run_pipeline
 
 __version__ = "0.1.0"
 
