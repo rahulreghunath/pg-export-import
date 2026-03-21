@@ -417,6 +417,7 @@ def _export_to_csv(
     else:
         query = sql.SQL("SELECT * FROM ") + table_sql
 
+    export_start = time.monotonic()
     logger.info("Starting export: table=%s where=%r", table_ref, where_clause or "(none)")
 
     # Resolve column names and type info via a LIMIT 0 probe BEFORE declaring
@@ -465,7 +466,7 @@ def _export_to_csv(
                 if row_count % 50_000 == 0:
                     logger.info("  … exported %d rows so far", row_count)
 
-    logger.info("Export complete: %d rows → %s", row_count, csv_path)
+    logger.info("Export complete: %d rows → %s  (%.2fs)", row_count, csv_path, time.monotonic() - export_start)
     return row_count, column_names
 
 
@@ -508,6 +509,7 @@ def _import_from_csv(
         + sql.SQL(") FROM STDIN WITH (FORMAT CSV, HEADER TRUE)")
     )
 
+    import_start = time.monotonic()
     logger.info(
         "Starting import: table=%s columns=%s file=%s",
         table_ref,
@@ -526,7 +528,7 @@ def _import_from_csv(
 
         imported = cur.rowcount
 
-    logger.info("Import complete: %d rows ← %s", imported, csv_path)
+    logger.info("Import complete: %d rows ← %s  (%.2fs)", imported, csv_path, time.monotonic() - import_start)
     return imported
 
 
@@ -795,6 +797,11 @@ def export_and_import(
             duration_seconds=time.monotonic() - start,
         )
 
+    total_seconds = time.monotonic() - start
+    logger.info(
+        "export_and_import complete: %s → %s  exported=%d deleted=%d imported=%d  total=%.2fs",
+        source_table, target_table, exported_count, deleted_count, imported_count, total_seconds,
+    )
     return ExportImportResult(
         exported_count=exported_count,
         imported_count=imported_count,
@@ -803,5 +810,5 @@ def export_and_import(
         source_table=source_table,
         target_table=target_table,
         status="success",
-        duration_seconds=time.monotonic() - start,
+        duration_seconds=total_seconds,
     )

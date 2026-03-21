@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
 from datetime import datetime
 from typing import Any
 
@@ -247,6 +248,7 @@ def run_pipeline(
     resolved_csv_dir = csv_dir if csv_dir is not None else tempfile.gettempdir()
     os.makedirs(resolved_csv_dir, exist_ok=True)
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pipeline_start = time.monotonic()
 
     logger.info(
         "Pipeline start: %d table(s), csv_dir=%s, run_ts=%s, fetch_size=%d, delete_before_import=%s",
@@ -266,4 +268,13 @@ def run_pipeline(
             logger.error("Stopping pipeline after failure on table %d/%d.", idx, total)
             break
 
+    attempted = len(summary)
+    succeeded = sum(1 for r in summary if r["status"] == "success")
+    skipped = total - attempted
+    logger.info(
+        "Pipeline complete: %d/%d table(s) succeeded%s  total=%.2fs",
+        succeeded, total,
+        f"  ({skipped} not attempted)" if skipped else "",
+        time.monotonic() - pipeline_start,
+    )
     return summary
