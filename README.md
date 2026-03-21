@@ -57,7 +57,9 @@ results = run_pipeline(
     source_config=src,
     target_config=tgt,
     tables=tables,
-    csv_dir="/data/exports",   # optional; defaults to tempdir
+    csv_dir="/data/exports",        # optional; defaults to tempdir
+    fetch_size=5000,                # optional; rows per round-trip (default 5000)
+    delete_before_import=True,      # optional; set False to append without deleting (default True)
 )
 for r in results:
     print(r["table"], r["status"], r["exported"], r["imported"])
@@ -84,49 +86,9 @@ Dots in schema-qualified names become underscores:
 
 ---
 
-## CLI usage
-
-Edit `TABLE_PIPELINE` in `src/pg_export_import/__main__.py` to define your tables, then run:
-
-```bash
-# Required env vars
-export SRC_PG_HOST=db1.example.com
-export SRC_PG_DB=prod
-export SRC_PG_PASSWORD=secret
-
-export TGT_PG_HOST=db2.example.com
-export TGT_PG_DB=staging
-export TGT_PG_PASSWORD=secret
-
-# Optional
-export CSV_DIR=/data/exports   # default: system temp directory
-
-pg-export-import
-# or
-python -m pg_export_import
-```
-
-### Environment variable reference
-
-| Variable          | Required | Default    | Description                              |
-|-------------------|----------|------------|------------------------------------------|
-| `SRC_PG_HOST`     | yes      | —          | Source PostgreSQL host                   |
-| `SRC_PG_DB`       | yes      | —          | Source database name                     |
-| `SRC_PG_PASSWORD` | yes      | —          | Source database password                 |
-| `SRC_PG_PORT`     | no       | `5432`     | Source PostgreSQL port                   |
-| `SRC_PG_USER`     | no       | `postgres` | Source database user                     |
-| `TGT_PG_HOST`     | yes      | —          | Target PostgreSQL host                   |
-| `TGT_PG_DB`       | yes      | —          | Target database name                     |
-| `TGT_PG_PASSWORD` | yes      | —          | Target database password                 |
-| `TGT_PG_PORT`     | no       | `5432`     | Target PostgreSQL port                   |
-| `TGT_PG_USER`     | no       | `postgres` | Target database user                     |
-| `CSV_DIR`         | no       | tempdir    | Output directory for intermediate CSVs   |
-
----
-
 ## Table config schema
 
-Each entry in `TABLE_PIPELINE` (or the `tables` argument to `run_pipeline`) supports:
+Each entry in the `tables` argument to `run_pipeline` supports:
 
 | Key                    | Type                      | Required | Description                                        |
 |------------------------|---------------------------|----------|----------------------------------------------------|
@@ -136,6 +98,8 @@ Each entry in `TABLE_PIPELINE` (or the `tables` argument to `run_pipeline`) supp
 | `where_params`         | tuple \| dict \| None     | no       | Bind values for `where_clause` placeholders        |
 | `delete_where_clause`  | str                       | no       | WHERE fragment for DELETE on target (defaults to `where_clause`) |
 | `delete_where_params`  | tuple \| dict \| None     | no       | Bind values for `delete_where_clause`              |
+| `fetch_size`           | int                       | no       | Per-table override for rows fetched per round-trip; takes precedence over `run_pipeline`'s `fetch_size` argument |
+| `delete_before_import` | bool                      | no       | Per-table override; when `False`, skips DELETE for this table regardless of the pipeline-level argument |
 
 ---
 

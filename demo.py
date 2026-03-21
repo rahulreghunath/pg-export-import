@@ -44,11 +44,11 @@ def _make_config(prefix: str) -> ConnectionConfig:
     """Build a ConnectionConfig from environment variables with the given prefix."""
     try:
         return ConnectionConfig(
-            host=os.environ[f"{prefix}_PG_HOST"],
-            port=int(os.environ.get(f"{prefix}_PG_PORT", "5432")),
-            dbname=os.environ[f"{prefix}_PG_DB"],
-            user=os.environ.get(f"{prefix}_PG_USER", "postgres"),
-            password=os.environ[f"{prefix}_PG_PASSWORD"],
+            host='192.168.10.13',
+            port=5439,
+            dbname='bayvrio_db',
+            user='postgres',
+            password='password123',
         )
     except KeyError as exc:
         logger.error("Missing required environment variable: %s", exc)
@@ -72,6 +72,7 @@ def demo_single_table(src: ConnectionConfig, tgt: ConnectionConfig, csv_dir: str
         target_table="drug_master1",
         where_clause="",                        # all rows
         csv_path=os.path.join(csv_dir, "drug_master_single.csv"),
+        fetch_size=5000,                        # explicit batch size
     )
 
     print(f"  Status   : {result.status}")
@@ -99,8 +100,8 @@ def demo_delete_then_export(src: ConnectionConfig, tgt: ConnectionConfig, csv_di
     print("DEMO 2: delete_target_rows + filtered export_and_import")
     print("=" * 60)
 
-    where_clause = "id <= %s"
-    where_params = (1000,)
+    where_clause = ""
+    where_params = None
 
     # Step 1 — delete rows that will be re-imported
     deleted = delete_target_rows(
@@ -146,12 +147,14 @@ def demo_pipeline(src: ConnectionConfig, tgt: ConnectionConfig, csv_dir: str) ->
     print("=" * 60)
 
     tables = [
-        # Parent table first
+        # Table 1 — inherits pipeline-level delete_before_import=True → DELETE runs
         {
             "source_table": "drug_master",
             "target_table": "drug_master1",
             "where_clause": "",        # all rows
             "where_params": None,
+            # "fetch_size": 2_000,     # uncomment to override batch size for this table
+            # "delete_before_import": False,  # uncomment to skip DELETE for this table only
         },
         # Add child tables below, e.g.:
         # {
@@ -159,6 +162,7 @@ def demo_pipeline(src: ConnectionConfig, tgt: ConnectionConfig, csv_dir: str) ->
         #     "target_table": "drug_detail1",
         #     "where_clause": "drug_id IN (SELECT id FROM drug_master)",
         #     "where_params": None,
+        #     "delete_before_import": False,  # append-only — no DELETE even though pipeline default is True
         # },
     ]
 
@@ -167,7 +171,9 @@ def demo_pipeline(src: ConnectionConfig, tgt: ConnectionConfig, csv_dir: str) ->
         target_config=tgt,
         tables=tables,
         stop_on_failure=True,
-        csv_dir=csv_dir,                # all CSV files share the run timestamp
+        csv_dir=csv_dir,
+        fetch_size=10_000,              # pipeline-level default; override per-table via "fetch_size" key
+        delete_before_import=True,      # pipeline-level default; override per-table via "delete_before_import" key
     )
 
     # Summary table

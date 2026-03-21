@@ -12,9 +12,6 @@ dependencies = [
     "psycopg[binary]>=3.1",
 ]
 
-[project.scripts]
-pg-export-import = "pg_export_import.__main__:main"
-
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",

@@ -135,8 +135,10 @@ def _process_table(
     total: int,
     csv_dir: str,
     run_ts: str,
+    fetch_size: int,
+    delete_before_import: bool,
 ) -> tuple[dict, bool]:
-    """Process a single table entry: delete target rows, export/import, clean CSV.
+    """Process a single table entry: optionally delete target rows, export/import, clean CSV.
 
     Args:
         source_config: Source database connection parameters.
@@ -147,6 +149,11 @@ def _process_table(
         csv_dir: Directory where CSV files are written.
         run_ts: Timestamp string shared by all tables in this pipeline run
             (``YYYYMMDD_HHMMSS`` format).
+        fetch_size: Default rows fetched per round-trip from the source cursor.
+            Overridden per-table via ``entry["fetch_size"]``.
+        delete_before_import: Whether to delete matching rows from the target
+            before importing.  Overridden per-table via
+            ``entry["delete_before_import"]``.
 
     Returns:
         ``(row, failed)`` where *row* is the result dict and *failed* is
@@ -158,10 +165,12 @@ def _process_table(
     where_params = entry.get("where_params", None)
     delete_where_clause = entry.get("delete_where_clause", where_clause)
     delete_where_params = entry.get("delete_where_params", where_params)
+    effective_fetch_size = entry.get("fetch_size", fetch_size)
+    should_delete = entry.get("delete_before_import", delete_before_import)
 
     logger.info(
-        "--- Table %d/%d: %s → %s  where=%r",
-        idx, total, source_table, target_table, where_clause or "(all rows)",
+        "--- Table %d/%d: %s → %s  where=%r  delete=%s",
+        idx, total, source_table, target_table, where_clause or "(all rows)", should_delete,
     )
 
     # Build deterministic CSV path: dots in table name replaced with underscores.
@@ -179,16 +188,19 @@ def _process_table(
         "error": None,
     }
 
-    # Step 1 — DELETE matching rows from target
-    try:
-        row["deleted"] = delete_target_rows(
-            target_config, target_table, delete_where_clause, delete_where_params
-        )
-    except Exception as exc:
-        row["status"] = "delete_failed"
-        row["error"] = str(exc)
-        logger.error("DELETE failed for %s: %s", target_table, exc, exc_info=True)
-        return row, True
+    # Step 1 — DELETE matching rows from target (skipped when should_delete is False)
+    if should_delete:
+        try:
+            row["deleted"] = delete_target_rows(
+                target_config, target_table, delete_where_clause, delete_where_params
+            )
+        except Exception as exc:
+            row["status"] = "delete_failed"
+            row["error"] = str(exc)
+            logger.error("DELETE failed for %s: %s", target_table, exc, exc_info=True)
+            return row, True
+    else:
+        logger.debug("Skipping DELETE for %s (delete_before_import=False)", target_table)
 
     # Step 2 — export_and_import
     try:
@@ -200,6 +212,7 @@ def _process_table(
             where_clause=where_clause,
             where_params=where_params,
             csv_path=csv_path,
+            fetch_size=effective_fetch_size,
         )
     except Exception as exc:
         row["status"] = "error"
@@ -243,6 +256,8 @@ def run_pipeline(
     tables: list[dict],
     stop_on_failure: bool = True,
     csv_dir: str | None = None,
+    fetch_size: int = 5000,
+    delete_before_import: bool = True,
 ) -> list[dict]:
     """Run the export/import pipeline sequentially for each table in *tables*.
 
@@ -273,12 +288,26 @@ def run_pipeline(
               DELETE step; falls back to *where_clause*
             * ``delete_where_params`` (tuple | dict | None, optional) — bind
               values for *delete_where_clause*
+            * ``fetch_size`` (int, optional) — per-table override for the
+              number of rows fetched per round-trip; takes precedence over the
+              pipeline-level *fetch_size* argument
+            * ``delete_before_import`` (bool, optional) — per-table override
+              for whether to delete matching rows from the target before
+              importing; takes precedence over the pipeline-level argument
 
         stop_on_failure: If ``True`` (default), halt on the first error.
             If ``False``, continue with remaining tables.
         csv_dir: Directory where intermediate CSV files are written.  Created
             automatically if it does not exist.  Defaults to the system temp
             directory when ``None``.
+        fetch_size: Rows fetched per round-trip from the source cursor for all
+            tables.  Individual tables can override this via ``"fetch_size"``
+            in their config dict.  Defaults to ``5000``.
+        delete_before_import: Whether to delete matching rows from the target
+            before importing, for all tables.  Set to ``False`` to append
+            without deleting (e.g. for insert-only / audit tables).  Individual
+            tables can override this via ``"delete_before_import"`` in their
+            config dict.  Defaults to ``True``.
 
     Returns:
         List of result dicts, one per table attempted:
@@ -293,8 +322,8 @@ def run_pipeline(
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     logger.info(
-        "Pipeline start: %d table(s), csv_dir=%s, run_ts=%s",
-        len(tables), resolved_csv_dir, run_ts,
+        "Pipeline start: %d table(s), csv_dir=%s, run_ts=%s, fetch_size=%d, delete_before_import=%s",
+        len(tables), resolved_csv_dir, run_ts, fetch_size, delete_before_import,
     )
 
     total = len(tables)
@@ -302,7 +331,8 @@ def run_pipeline(
 
     for idx, entry in enumerate(tables, start=1):
         row, failed = _process_table(
-            source_config, target_config, entry, idx, total, resolved_csv_dir, run_ts
+            source_config, target_config, entry, idx, total,
+            resolved_csv_dir, run_ts, fetch_size, delete_before_import,
         )
         summary.append(row)
         if failed and stop_on_failure:
