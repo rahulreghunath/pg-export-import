@@ -565,31 +565,48 @@ def delete_target_rows(
     """
     table_sql = _build_table_sql(table_ref)  # validates identifiers
 
-    if where_clause.strip():
+    use_truncate = not where_clause.strip()
+
+    if use_truncate:
+        # TRUNCATE is far faster than DELETE for full-table wipes: no per-row
+        # WAL entries, no sequential scan, and it resets the table storage.
+        # Safe here because we re-import all rows immediately after.
+        truncate_query = sql.SQL("TRUNCATE ") + table_sql
+        logger.info("TRUNCATE %s (no WHERE clause — faster than DELETE)", table_ref)
+
+        delete_start = time.monotonic()
+        with _connect(target_config) as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(truncate_query)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        logger.info("Truncated %s  (%.2fs)", table_ref, time.monotonic() - delete_start)
+        return 0  # TRUNCATE doesn't report rowcount
+    else:
         delete_query = (
             sql.SQL("DELETE FROM ")
             + table_sql
             + sql.SQL(" WHERE ")
             + sql.SQL(where_clause)
         )
-    else:
-        logger.warning(
-            "DELETE on %s has no WHERE clause — ALL rows will be deleted.", table_ref
-        )
-        delete_query = sql.SQL("DELETE FROM ") + table_sql
 
-    with _connect(target_config) as conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(delete_query, where_params)
-                deleted = cur.rowcount
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        delete_start = time.monotonic()
+        with _connect(target_config) as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(delete_query, where_params)
+                    deleted = cur.rowcount
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
-    logger.info("Deleted %d rows from %s", deleted, table_ref)
-    return deleted
+        logger.info("Deleted %d rows from %s  (%.2fs)", deleted, table_ref, time.monotonic() - delete_start)
+        return deleted
 
 
 def export_and_import(

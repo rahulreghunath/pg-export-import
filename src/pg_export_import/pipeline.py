@@ -96,6 +96,7 @@ def _process_table(
     effective_fetch_size = entry.get("fetch_size", fetch_size)
     should_delete = entry.get("delete_before_import", delete_before_import)
 
+    table_start = time.monotonic()
     logger.info(
         "--- Table %d/%d: %s → %s  where=%r  delete=%s",
         idx, total, source_table, target_table, where_clause or "(all rows)", should_delete,
@@ -125,7 +126,8 @@ def _process_table(
         except Exception as exc:
             row["status"] = "delete_failed"
             row["error"] = str(exc)
-            logger.error("DELETE failed for %s: %s", target_table, exc, exc_info=True)
+            row["duration"] = time.monotonic() - table_start
+            logger.error("DELETE failed for %s: %s  (%.2fs)", target_table, exc, row["duration"], exc_info=True)
             return row, True
     else:
         logger.debug("Skipping DELETE for %s (delete_before_import=False)", target_table)
@@ -145,7 +147,8 @@ def _process_table(
     except Exception as exc:
         row["status"] = "error"
         row["error"] = str(exc)
-        logger.error("export_and_import raised for %s: %s", source_table, exc, exc_info=True)
+        row["duration"] = time.monotonic() - table_start
+        logger.error("export_and_import raised for %s: %s  (%.2fs)", source_table, exc, row["duration"], exc_info=True)
         return row, True
 
     row["exported"] = result.exported_count
@@ -170,6 +173,12 @@ def _process_table(
     except OSError as exc:
         logger.warning("Could not remove CSV %s: %s", result.csv_path, exc)
 
+    table_elapsed = time.monotonic() - table_start
+    row["duration"] = table_elapsed
+    logger.info(
+        "--- Table %d/%d complete: %s  exported=%d deleted=%d imported=%d  (%.2fs)",
+        idx, total, source_table, row["exported"], row["deleted"], row["imported"], table_elapsed,
+    )
     return row, False
 
 
