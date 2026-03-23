@@ -7,3 +7,4 @@ build/
 *.csv
 uv.lock
 .tests/
+.vscode/

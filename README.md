@@ -5,8 +5,7 @@ Stream-export filtered PostgreSQL rows to CSV and bulk-import via `COPY`.  Suppo
 ## Installation
 
 ```bash
-pip install -e .          # editable / development
-pip install -e ".[dev]"   # include pytest
+pip install pg-export-import
 ```
 
 ## Requirements

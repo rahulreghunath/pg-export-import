@@ -63,4 +63,5 @@ pg-export-import = { workspace = true }
 [dependency-groups]
 dev = [
     "pg-export-import",
+    "pre-commit>=4.5.1",
 ]
