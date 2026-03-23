@@ -108,22 +108,6 @@ Each entry in the `tables` argument to `run_pipeline` supports:
 
 ---
 
-## Performance notes
-
-### TRUNCATE for full-table deletes
-
-When `delete_before_import=True` and the `where_clause` is empty (i.e. exporting all rows), `delete_target_rows()` uses `TRUNCATE` instead of `DELETE FROM`. This is significantly faster for large tables because TRUNCATE:
-
-- Does not scan rows or write per-row WAL entries
-- Reclaims storage immediately
-- Completes in near-constant time regardless of table size
-
-This applies automatically to Category A (master/reference) tables where no WHERE filter is needed. When a `where_clause` is provided, a standard `DELETE ... WHERE` is used as before.
-
-**Note:** `TRUNCATE` does not return a row count, so `deleted_count` will be `0` for truncated tables. The `deleted_count` field only reflects rows removed via filtered `DELETE`.
-
----
-
 ## Security notes
 
 - `where_clause` is embedded as a raw SQL fragment — it **must** come from trusted application code, never from user input.
