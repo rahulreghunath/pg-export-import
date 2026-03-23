@@ -10,7 +10,7 @@ readme = "README.md"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [
-  { name = "Your Name", email = "me@rahulr.me" }
+  { name = "Rahul R", email = "me@rahulr.me" }
 ]
 keywords = [
     "postgresql",
