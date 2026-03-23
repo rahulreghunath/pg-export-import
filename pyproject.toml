@@ -7,11 +7,10 @@ name = "pg-export-import"
 version = "0.1.0b1"
 description = "Stream-export filtered PostgreSQL rows to CSV and bulk-import via COPY"
 readme = "README.md"
-license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [
-    { name = "pg-export-import contributors" },
+  { name = "Your Name", email = "me@rahulr.me" }
 ]
 keywords = [
     "postgresql",
@@ -40,15 +39,15 @@ dependencies = [
     "psycopg[binary]>=3.1",
 ]
 
-[project.urls]
-Homepage = "https://github.com/rahulraina7/pg-export-import"
-Repository = "https://github.com/rahulraina7/pg-export-import"
-Issues = "https://github.com/rahulraina7/pg-export-import/issues"
-
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/rahulreghunath/pg-export-import"
+Repository = "https://github.com/rahulreghunath/pg-export-import"
+Issues = "https://github.com/rahulreghunath/pg-export-import/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
