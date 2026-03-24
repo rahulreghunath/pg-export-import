@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pg-export-import"
-version = "0.1.0b1"
+version = "0.1.0b3"
 description = "Stream-export filtered PostgreSQL rows to CSV and bulk-import via COPY"
 readme = "README.md"
 license-files = ["LICENSE"]
