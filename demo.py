@@ -181,14 +181,14 @@ def demo_pipeline(src: ConnectionConfig, tgt: ConnectionConfig, csv_dir: str) ->
 if __name__ == "__main__":
     csv_dir = os.environ.get("CSV_DIR", "/tmp/pg_demo")
     src_config = ConnectionConfig(
-        host="localhost",
+        host="source_host",
         port=5434,
         dbname="db_name",
         user="db_user",
         password="db_password",
     )
     tgt_config = ConnectionConfig(
-        host="localhost",
+        host="target_host",
         port=5434,
         dbname="db_name",
         user="db_user",
